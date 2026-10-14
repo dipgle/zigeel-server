@@ -69,6 +69,61 @@ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: Strin
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
+/// Paid gate (remote project). When PAID_API is set (e.g. http://127.0.0.1:22114), every
+/// attempt to open a session through this hbbs -- a PunchHoleRequest, or a RequestRelay that
+/// hbbs would forward to the peer -- is reported to the account API, which decides whether
+/// it may proceed and records who opened it (so it can later cut guest sessions through the
+/// target's heartbeat). Returns Some(message for the user) when the attempt must be refused.
+/// Account API unreachable => refuse, unless PAID_FAIL_OPEN=1.
+async fn paid_check(token: &str, target: &str, kind: &str, addr: SocketAddr) -> Option<String> {
+    let api = match std::env::var("PAID_API") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return None,
+    };
+    let fail_open = std::env::var("PAID_FAIL_OPEN").map(|v| v == "1").unwrap_or(false);
+    let url = format!("{}/internal/punch", api.trim_end_matches('/'));
+    let res: ResultType<(bool, serde_json::Value)> = async {
+        let resp = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?
+            .post(&url)
+            .json(&serde_json::json!({
+                "token": token,
+                "target": target,
+                "kind": kind,
+                "from": addr.to_string(),
+            }))
+            .send()
+            .await?;
+        let ok = resp.status().is_success();
+        let body: serde_json::Value = resp.json().await?;
+        Ok((ok, body))
+    }
+    .await;
+    let unavailable = |why: String| {
+        log::error!("paid_check: account API unusable ({}), fail_open={}", why, fail_open);
+        if fail_open {
+            None
+        } else {
+            Some("Account server unavailable, try again later".to_owned())
+        }
+    };
+    match res {
+        Ok((true, body)) => match body["allow"].as_bool() {
+            Some(true) => None,
+            Some(false) => Some(
+                body["msg"]
+                    .as_str()
+                    .unwrap_or("Refused by account server")
+                    .to_owned(),
+            ),
+            None => unavailable(format!("no 'allow' in answer: {}", body)),
+        },
+        Ok((false, body)) => unavailable(format!("HTTP error, body {}", body)),
+        Err(err) => unavailable(err.to_string()),
+    }
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -495,6 +550,16 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    if let Some(msg) = paid_check(&rf.token, &rf.id, "relay", addr).await {
+                        log::warn!("Paid gate refused relay request from {} to {}: {}", addr, rf.id, msg);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: msg,
+                            ..Default::default()
+                        });
+                        self.send_to_tcp(msg_out, addr).await;
+                        return true;
+                    }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -684,6 +749,16 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if let Some(msg) = paid_check(&ph.token, &ph.id, "punch", addr).await {
+            log::warn!("Paid gate refused punch hole from {} to {}: {}", addr, ph.id, msg);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                other_failure: msg,
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -912,18 +987,24 @@ impl RendezvousServer {
 
     fn parse_relay_servers(&mut self, relay_servers: &str) {
         let rs = get_servers(relay_servers, "relay-servers");
+        log::info!("relay geo:\n{}", crate::relay_geo::describe(&rs));
         self.relay_servers0 = Arc::new(rs);
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
-        self.relay_servers[i].clone()
+        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst);
+        // Zigeel: the relays nearest to both ends by client location, round-robin among those tied;
+        // no usable location => every relay, as upstream (relay_geo.rs).
+        match crate::relay_geo::choose(&self.relay_servers, pa, pb) {
+            Some(near) if !near.is_empty() => self.relay_servers[near[i % near.len()]].clone(),
+            _ => self.relay_servers[i % self.relay_servers.len()].clone(),
+        }
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
@@ -934,8 +1015,9 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
+                    "relay-geo(rgeo)",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
@@ -1072,6 +1154,9 @@ impl RendezvousServer {
                         ALWAYS_USE_RELAY.load(Ordering::SeqCst)
                     );
                 }
+            }
+            Some("relay-geo" | "rgeo") => {
+                res = crate::relay_geo::describe(&self.relay_servers);
             }
             Some("test-geo" | "tg") => {
                 if let Some(rs) = fds.next() {
